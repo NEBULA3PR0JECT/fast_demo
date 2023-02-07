@@ -4,10 +4,13 @@ from database.arangodb import NEBULA_DB
 import uuid
 from nebula3_videoprocessing.videoprocessing.expert.videoprocessing_expert import VideoProcessingExpert
 from visual_clues.visual_clues.run_visual_clues import TokensPipeline
-from nebula3_llm_task.run_llm_task import test
+from nebula3_fusion.run_fusion_task import test as fusion_test
+from nebula3_llm_task.run_llm_task import test as llm_test
+from visual_clues.visual_clues.run_sprint4 import test as visual_clues_test
 import os 
 import time
 from nebula3_reid.facenet_pytorch.pipeline_task.reid_task import test_pipeline_task
+from nebula3_reid.facenet_pytorch.examples.reid_inference_mdf import FaceReId
 
 class InitialPipeline:
     def __init__(self):
@@ -21,7 +24,7 @@ class InitialPipeline:
     def validate_url(self, url_link):
         return url_link
 
-    def init_pipeline(self, url_link):
+    def init_pipeline(self, url_link, pipeline_id = ''):
         """
         Inserts Initial data to our pipelines document and returns pipeline_id
         """
@@ -33,20 +36,34 @@ class InitialPipeline:
                 _movie = {"movie_id": "", "url": movie_url, "type": "image"}
             pipeline_entry = self.wf_template.copy()
             pipeline_entry['inputs']['videoprocessing']['movies'] = [_movie]
-            pipeline_entry['id'] = str(uuid.uuid4())
+            if not pipeline_id:
+                pipeline_entry['id'] = str(uuid.uuid4())
+            else:
+                pipeline_entry['id'] = pipeline_id
             pipeline_entry['_key'] = pipeline_entry['id']
             self.db.collection("pipelines").insert(pipeline_entry)
             pipeline_id = pipeline_entry['id']
             return pipeline_id
         else:
             return ''
+    
+    def update_pipeline_status(self, current_task):
+        pipeline_dict = dict()
+        pipeline_dict["unique_key"] = "123456789"
+        pipeline_dict["url_link"] = ""
+        pipeline_dict["pipeline_id"] = ""
+        pipeline_dict["fetching"] = True
+        pipeline_dict["current_task"] = current_task
+        self.nre.write_doc_by_key(doc=pipeline_dict, collection_name="pipeline_url", key_list=['unique_key'])
+    
+
 
 
 def main():
     
     pipeline_instance = InitialPipeline()
     start_time = time.time()
-    pipeline_id = pipeline_instance.init_pipeline('https://variety.com/wp-content/uploads/2017/01/john-wick-2.jpg') #"5b0c75bf-5fd6-4c1e-9f7e-5f51a9a96bd8"
+    pipeline_id = pipeline_instance.init_pipeline('https://saucepankids.com/wp-content/uploads/2019/06/Untitled-design-26.png') #"5b0c75bf-5fd6-4c1e-9f7e-5f51a9a96bd8"
     # Necessary for videoprocessing task
     os.environ['ARANGO_HOST'] = "172.83.9.249"
     os.environ['EXPERT_RUN_MODE'] = 'task'
@@ -55,35 +72,56 @@ def main():
     videoprocessing_instance = VideoProcessingExpert()
     videoprocessing_instance.run_pipeline_task()
 
-    test_pipeline_task(pipeline_id)
+    # run reid
+    reid_instance = FaceReId()
+    test_pipeline_task(pipeline_id, reid_instance)
     # end_time2 = time.time() - start_time
     # print("Total time it took for videprocessing: {}".format(end_time2))
     # Get movie id for visual clues, reid and llm.
     pipeline_structure = pipeline_instance.nre.get_pipeline_structure(pipeline_id)
     movie_id = list(pipeline_structure['movies'].keys())[0]
+    # run visual_clues test
     visual_clues_instance = TokensPipeline()
-    visual_clues_instance.run_visual_clues_pipeline(movie_id)
+    visual_clues_test(visual_clues_instance)
+    # run fusion
+    fusion_test()
     # run llm
-    test()
+    llm_test()
     end_time = time.time() - start_time
     print("Total time it took for whole pipeline: {}".format(end_time))
 
 
     ##########################
+    # Clean the document first from previous url and pipeline_id if it wasn't empty.
+    pipeline_dict = dict()
+    pipeline_dict["unique_key"] = "123456789"
+    pipeline_dict["url_link"] = ""
+    pipeline_dict["pipeline_id"] = ""
+    pipeline_dict["fetching"] = False
+    pipeline_dict["current_task"] = ""
+    pipeline_instance.nre.write_doc_by_key(doc=pipeline_dict, collection_name="pipeline_url", key_list=['unique_key'])
 
     while True:
         time.sleep(1)
         rc = pipeline_instance.nre.get_doc_by_key({'_key': "123456789"}, "pipeline_url")
-        url_link = rc["url_link"]
+        pipeline_id = ''
+        url_link = ''
+        if rc:
+            url_link = rc["url_link"]
+            if rc["pipeline_id"]: # this is for my web gui
+                pipeline_id = pipeline_instance.init_pipeline(url_link, rc["pipeline_id"])
+            else: # This is for 8032 - it doesnt append pipeline id to the pipeline_url document..
+                pipeline_id = pipeline_instance.init_pipeline(url_link)
+
 
         if url_link:
-            start_time = time.time()
-            pipeline_id = pipeline_instance.init_pipeline(url_link) #"5b0c75bf-5fd6-4c1e-9f7e-5f51a9a96bd8"
+            start_time = time.time() #"5b0c75bf-5fd6-4c1e-9f7e-5f51a9a96bd8")
             # Necessary for videoprocessing task
             os.environ['ARANGO_HOST'] = "172.83.9.249"
             os.environ['EXPERT_RUN_MODE'] = 'task'
             os.environ['PIPELINE_ID'] = pipeline_id
             videoprocessing_instance.run_pipeline_task()
+            pipeline_instance.update_pipeline_status("videoprocessing")
             end_time2 = time.time() - start_time
             print("Total time it took for videprocessing: {}".format(end_time2))
             # Get movie id for visual clues, reid and llm.
@@ -91,10 +129,19 @@ def main():
             pipeline_structure = pipeline_instance.nre.get_pipeline_structure(pipeline_id)
             if pipeline_structure['movies']:
                 movie_id = list(pipeline_structure['movies'].keys())[0]
-                test_pipeline_task(pipeline_id)
-                visual_clues_instance.run_visual_clues_pipeline(movie_id)
+                # run reid
+                test_pipeline_task(pipeline_id, reid_instance)
+                pipeline_instance.update_pipeline_status("reid")
+                # run visual_clues 
+                visual_clues_test(visual_clues_instance)
+                pipeline_instance.update_pipeline_status("visual_clues")
+                # run fusion
+                fusion_test()
+                pipeline_instance.update_pipeline_status("fusion")
                 # run llm
-                test()
+                llm_test()
+                pipeline_instance.update_pipeline_status("llm")
+
                 end_time = time.time() - start_time
                 print("Total time it took for whole pipeline: {}".format(end_time))
 
@@ -102,9 +149,13 @@ def main():
             cur_url_link = rc2["url_link"]
             pipeline_dict = dict()
             pipeline_dict["unique_key"] = rc["unique_key"]
-            if cur_url_link == url_link: # if someone appends new image url before the previous one is done I want to keep it in queue.
-                pipeline_dict["url_link"] = ""
-                pipeline_instance.nre.write_doc_by_key(doc=pipeline_dict, collection_name="pipeline_url", key_list=['unique_key'])
+            
+            pipeline_dict["url_link"] = ""
+            pipeline_dict["pipeline_id"] = ""
+            pipeline_dict["fetching"] = False
+            pipeline_dict["current_task"] = ""
+            time.sleep(1)
+            pipeline_instance.nre.write_doc_by_key(doc=pipeline_dict, collection_name="pipeline_url", key_list=['unique_key'])
 
         else:
             print("Waiting for URL...")
